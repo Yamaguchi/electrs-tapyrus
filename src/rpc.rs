@@ -224,9 +224,21 @@ impl Connection {
     fn blockchain_scripthash_get_balance(&self, params: &[Value]) -> Result<Value> {
         let script_hash = hash_from_value(params.get(0)).chain_err(|| "bad script_hash")?;
         let status = self.query.status(&script_hash[..])?;
-        Ok(
-            json!({ "confirmed": status.confirmed_balance(), "unconfirmed": status.mempool_balance() }),
-        )
+        Ok(json!({
+            "confirmed": status.confirmed_balance(),
+            "unconfirmed": status.mempool_balance(),
+            "assets": status.assets_balance().iter().map(|(asset_id, confirmed, unconfirmed)| {
+                json!({
+                    "asset_id": format!("{}", asset_id),
+                    "confirmed_asset_quantity": confirmed,
+                    "unconfirmed_asset_quantity": unconfirmed,
+                })
+            }).collect::<Value>(),
+            "uncolored" : {
+                "confirmed": status.confirmed_uncolored_blance(),
+                "unconfirmed": status.mempool_uncolored_blance(),
+            }
+        }))
     }
 
     fn blockchain_scripthash_get_history(&self, params: &[Value]) -> Result<Value> {

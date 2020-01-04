@@ -10,6 +10,8 @@ use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, RwLock};
 use tapyrus::blockdata::transaction::Transaction;
 use tapyrus::blockdata::transaction::TxOut;
@@ -24,6 +26,7 @@ use crate::metrics::Metrics;
 use crate::store::{ReadStore, Row};
 use crate::util::{FullHash, HashPrefix, HeaderEntry};
 
+#[derive(Clone)]
 pub struct FundingOutput {
     pub txn_id: Sha256dHash,
     pub height: u32,
@@ -49,17 +52,17 @@ impl FundingOutput {
         }
     }
 
-    pub fn colored(&self) -> Option<&Self> {
+    pub fn colored(&self) -> Option<Self> {
         if self.asset.is_some() {
-            Some(self)
+            Some(self.clone())
         } else {
             None
         }
     }
 
-    pub fn uncolored(&self) -> Option<&Self> {
+    pub fn uncolored(&self) -> Option<Self> {
         if self.asset.is_none() {
-            Some(self)
+            Some(self.clone())
         } else {
             None
         }
@@ -107,6 +110,7 @@ impl Serialize for Asset {
 
 type OutPoint = (Sha256dHash, usize); // (txid, output_index)
 
+#[derive(Clone)]
 struct SpendingInput {
     txn_id: Sha256dHash,
     height: u32,
@@ -125,6 +129,24 @@ fn calc_balance((funding, spending): &(Vec<FundingOutput>, Vec<SpendingInput>)) 
     funded as i64 - spent as i64
 }
 
+fn unspent_of<'a>(
+    (funding, spending): &'a (Vec<FundingOutput>, Vec<SpendingInput>),
+) -> Vec<&'a FundingOutput> {
+    let mut outputs_map = HashMap::<OutPoint, &FundingOutput>::new();
+    for f in funding.iter() {
+        outputs_map.insert((f.txn_id, f.output_index), f);
+    }
+    for s in spending.iter() {
+        outputs_map.remove(&s.funding_output);
+    }
+    let mut outputs = outputs_map
+        .into_iter()
+        .map(|item| item.1) // a reference to unspent output
+        .collect::<Vec<&'a FundingOutput>>();
+    outputs.sort_unstable_by_key(|out| out.height);
+    outputs
+}
+
 impl Status {
     fn funding(&self) -> impl Iterator<Item = &FundingOutput> {
         self.confirmed.0.iter().chain(self.mempool.0.iter())
@@ -140,6 +162,114 @@ impl Status {
 
     pub fn mempool_balance(&self) -> i64 {
         calc_balance(&self.mempool)
+    }
+
+    pub fn confirmed_uncolored_blance(&self) -> i64 {
+        let funding: Vec<FundingOutput> = self
+            .confirmed
+            .0
+            .iter()
+            .filter_map(|f| f.uncolored())
+            .collect();
+
+        let mut outputs_map = HashMap::<OutPoint, &FundingOutput>::new();
+        for f in &funding {
+            outputs_map.insert((f.txn_id, f.output_index), f);
+        }
+        let spending = self.confirmed.1.iter().cloned().collect();
+        calc_balance(&(funding, spending))
+    }
+
+    pub fn mempool_uncolored_blance(&self) -> i64 {
+        for f in &self.mempool.0 {
+            println!("mempool output: {}", f.value);
+        }
+        for s in &self.mempool.1 {
+            println!("mempool input: {}", s.value);
+        }
+        let funding: Vec<FundingOutput> = self
+            .mempool
+            .0
+            .iter()
+            .filter_map(|f| f.uncolored())
+            .collect();
+
+        let mut outputs_map = HashMap::<OutPoint, &FundingOutput>::new();
+        for f in &funding {
+            outputs_map.insert((f.txn_id, f.output_index), f);
+        }
+        let spending = self.mempool.1.iter().cloned().collect();
+        calc_balance(&(funding, spending))
+    }
+
+    pub fn confirmed_unspent(&self) -> Vec<&FundingOutput> {
+        unspent_of(&self.confirmed)
+    }
+
+    pub fn unconfirmed_unspent(&self) -> Vec<&FundingOutput> {
+        unspent_of(&self.mempool)
+    }
+
+    pub fn assets_balance(&self) -> Vec<(AssetId, i64, i64)> {
+        let mut asset_ids = HashSet::<String>::new();
+        let mut confirmed_assets_map = HashMap::<String, Vec<&FundingOutput>>::new();
+        for output in self.confirmed_unspent() {
+            if let Some(asset) = &output.asset {
+                let key = format!("{}", asset.asset_id);
+                if confirmed_assets_map.contains_key(&key) {
+                    let mut outputs = confirmed_assets_map[&key].clone();
+                    outputs.push(output);
+                    confirmed_assets_map.insert(key.clone(), outputs);
+                } else {
+                    confirmed_assets_map.insert(key.clone(), vec![output]);
+                    asset_ids.insert(key.clone());
+                }
+            }
+        }
+        let mut unconfirmed_assets_map = HashMap::<String, Vec<&FundingOutput>>::new();
+        for output in self.unconfirmed_unspent() {
+            if let Some(asset) = &output.asset {
+                let key = format!("{}", asset.asset_id);
+                if unconfirmed_assets_map.contains_key(&key) {
+                    let mut outputs = unconfirmed_assets_map[&key].clone();
+                    outputs.push(output);
+                    unconfirmed_assets_map.insert(key.clone(), outputs);
+                } else {
+                    unconfirmed_assets_map.insert(key.clone(), vec![output]);
+                    asset_ids.insert(key.clone());
+                }
+            }
+        }
+        asset_ids
+            .iter()
+            .map(|asset_id| {
+                let confirmed_asset_quantity =
+                    if let Some(confirmed_assets) = confirmed_assets_map.get(asset_id) {
+                        confirmed_assets
+                            .iter()
+                            .flat_map(|o| &o.asset)
+                            .map(|a| a.asset_quantity as i64)
+                            .sum()
+                    } else {
+                        0
+                    };
+                let unconfirmed_asset_quantity =
+                    if let Some(unconfirmed_assets) = unconfirmed_assets_map.get(asset_id) {
+                        unconfirmed_assets
+                            .iter()
+                            .flat_map(|o| &o.asset)
+                            .map(|a| a.asset_quantity as i64)
+                            .sum()
+                    } else {
+                        0
+                    };
+                (
+                    AssetId::from_str(asset_id).unwrap(),
+                    confirmed_asset_quantity,
+                    unconfirmed_asset_quantity,
+                )
+            })
+            .collect()
     }
 
     pub fn history(&self) -> Vec<(i32, Sha256dHash)> {
@@ -174,11 +304,11 @@ impl Status {
         outputs
     }
 
-    pub fn colored_unspent(&self) -> Vec<&FundingOutput> {
+    pub fn colored_unspent(&self) -> Vec<FundingOutput> {
         self.unspent().iter().filter_map(|&o| o.colored()).collect()
     }
 
-    pub fn uncolored_unspent(&self) -> Vec<&FundingOutput> {
+    pub fn uncolored_unspent(&self) -> Vec<FundingOutput> {
         self.unspent()
             .iter()
             .filter_map(|&o| o.uncolored())
@@ -769,25 +899,37 @@ mod tests {
     use crate::query::{Asset, AssetCache, AssetId, FundingOutput, Query, SpendingInput, Status};
 
     fn status() -> Status {
-        let txid1 = Sha256dHash::from_str(
-            "0000000000000000000000000000000000000000000000000000000000000000",
-        )
-        .unwrap();
-        let txid2 = Sha256dHash::from_str(
-            "1111111111111111111111111111111111111111111111111111111111111111",
-        )
-        .unwrap();
-
         let confirmed_fundings: Vec<FundingOutput> = vec![
-            FundingOutput::build(txid1, 0, 1, 2, None),
-            FundingOutput::build(txid1, 3, 4, 5, asset_1(6)),
-            FundingOutput::build(txid1, 7, 8, 9, asset_1(10)),
+            FundingOutput::build(txid_1(), 0, 1, 2, None),
+            FundingOutput::build(txid_1(), 3, 4, 5, asset_1(6)),
+            FundingOutput::build(txid_1(), 7, 8, 9, asset_1(10)),
+            FundingOutput::build(txid_1(), 11, 12, 13, asset_1(14)),
+            FundingOutput::build(txid_1(), 15, 16, 17, None),
         ];
-        let confirmed_spendings: Vec<SpendingInput> = Vec::new();
+        let confirmed_spendings: Vec<SpendingInput> = vec![
+            SpendingInput {
+                txn_id: txid_0(),
+                height: 3,
+                funding_output: (txid_1(), 4),
+                value: 5,
+            },
+            SpendingInput {
+                txn_id: txid_0(),
+                height: 11,
+                funding_output: (txid_1(), 12),
+                value: 13,
+            },
+            SpendingInput {
+                txn_id: txid_0(),
+                height: 15,
+                funding_output: (txid_1(), 16),
+                value: 17,
+            },
+        ];
         let unconfirmed_fundings: Vec<FundingOutput> = vec![
-            FundingOutput::build(txid2, 11, 12, 13, None),
-            FundingOutput::build(txid2, 14, 15, 16, asset_1(17)),
-            FundingOutput::build(txid2, 18, 19, 20, asset_1(21)),
+            FundingOutput::build(txid_2(), 11, 12, 13, None),
+            FundingOutput::build(txid_2(), 14, 15, 16, asset_1(17)),
+            FundingOutput::build(txid_2(), 18, 19, 20, asset_1(21)),
         ];
         let unconfirmed_spendings: Vec<SpendingInput> = Vec::new();
         Status {
@@ -797,56 +939,48 @@ mod tests {
     }
 
     #[test]
-    fn test_colored_unspent() {
-        let txid1 = Sha256dHash::from_str(
-            "0000000000000000000000000000000000000000000000000000000000000000",
-        )
-        .unwrap();
-        let txid2 = Sha256dHash::from_str(
-            "1111111111111111111111111111111111111111111111111111111111111111",
-        )
-        .unwrap();
+    fn test_confirmed_uncolored_blance() {
+        let status = status();
+        let balance = status.confirmed_uncolored_blance();
+        assert_eq!(balance, 2);
+    }
 
+    #[test]
+    fn test_mempool_uncolored_blance() {
+        let status = status();
+        let balance = status.mempool_uncolored_blance();
+        assert_eq!(balance, 13);
+    }
+
+    #[test]
+    fn test_colored_unspent() {
         let status = status();
         let unspents = status.colored_unspent();
-        assert_eq!(unspents.len(), 4);
-        assert_eq!(unspents[0].txn_id, txid1);
-        assert_eq!(unspents[0].height, 3);
-        assert_eq!(unspents[0].value, 5);
-        assert_eq!(unspents[0].asset.as_ref().unwrap().asset_quantity, 6);
-        assert_eq!(unspents[1].txn_id, txid1);
-        assert_eq!(unspents[1].height, 7);
-        assert_eq!(unspents[1].value, 9);
-        assert_eq!(unspents[1].asset.as_ref().unwrap().asset_quantity, 10);
-        assert_eq!(unspents[2].txn_id, txid2);
-        assert_eq!(unspents[2].height, 14);
-        assert_eq!(unspents[2].value, 16);
-        assert_eq!(unspents[2].asset.as_ref().unwrap().asset_quantity, 17);
-        assert_eq!(unspents[3].txn_id, txid2);
-        assert_eq!(unspents[3].height, 18);
-        assert_eq!(unspents[3].value, 20);
-        assert_eq!(unspents[3].asset.as_ref().unwrap().asset_quantity, 21);
+        assert_eq!(unspents.len(), 3);
+        assert_eq!(unspents[0].txn_id, txid_1());
+        assert_eq!(unspents[0].height, 7);
+        assert_eq!(unspents[0].value, 9);
+        assert_eq!(unspents[0].asset.as_ref().unwrap().asset_quantity, 10);
+        assert_eq!(unspents[1].txn_id, txid_2());
+        assert_eq!(unspents[1].height, 14);
+        assert_eq!(unspents[1].value, 16);
+        assert_eq!(unspents[1].asset.as_ref().unwrap().asset_quantity, 17);
+        assert_eq!(unspents[2].txn_id, txid_2());
+        assert_eq!(unspents[2].height, 18);
+        assert_eq!(unspents[2].value, 20);
+        assert_eq!(unspents[2].asset.as_ref().unwrap().asset_quantity, 21);
     }
 
     #[test]
     fn test_uncolored_unspent() {
-        let txid1 = Sha256dHash::from_str(
-            "0000000000000000000000000000000000000000000000000000000000000000",
-        )
-        .unwrap();
-        let txid2 = Sha256dHash::from_str(
-            "1111111111111111111111111111111111111111111111111111111111111111",
-        )
-        .unwrap();
-
         let status = status();
         let unspents = status.uncolored_unspent();
         assert_eq!(unspents.len(), 2);
-        assert_eq!(unspents[0].txn_id, txid1);
+        assert_eq!(unspents[0].txn_id, txid_1());
         assert_eq!(unspents[0].height, 0);
         assert_eq!(unspents[0].value, 2);
         assert_eq!(unspents[0].asset, None);
-        assert_eq!(unspents[1].txn_id, txid2);
+        assert_eq!(unspents[1].txn_id, txid_2());
         assert_eq!(unspents[1].height, 11);
         assert_eq!(unspents[1].value, 13);
         assert_eq!(unspents[1].asset, None);
@@ -854,11 +988,7 @@ mod tests {
 
     #[test]
     fn test_to_json() {
-        let txid = Sha256dHash::from_str(
-            "0000000000000000000000000000000000000000000000000000000000000000",
-        )
-        .unwrap();
-        let output = FundingOutput::build(txid, 0, 1, 2, None);
+        let output = FundingOutput::build(txid_0(), 0, 1, 2, None);
         let value = output.to_json();
         assert_json_eq!(
             value,
@@ -873,11 +1003,7 @@ mod tests {
 
     #[test]
     fn test_asset_to_json() {
-        let txid = Sha256dHash::from_str(
-            "0000000000000000000000000000000000000000000000000000000000000000",
-        )
-        .unwrap();
-        let output = FundingOutput::build(txid, 0, 1, 2, asset_1(3));
+        let output = FundingOutput::build(txid_0(), 0, 1, 2, asset_1(3));
         let value = output.to_json();
         assert_json_eq!(
             value,
@@ -897,15 +1023,11 @@ mod tests {
     #[test]
     fn test_asset_cache() {
         let asset_cache = AssetCache::new(10);
-        let txid = Sha256dHash::from_str(
-            "0000000000000000000000000000000000000000000000000000000000000000",
-        )
-        .unwrap();
         let asset = Asset {
             asset_id: AssetId::new(&Script::new(), Network::Bitcoin),
             asset_quantity: 1,
         };
-        let result = asset_cache.get_or_else(&txid, || Ok(vec![Some(asset.clone())]));
+        let result = asset_cache.get_or_else(&txid_0(), || Ok(vec![Some(asset.clone())]));
         match result {
             Ok(assets) => {
                 let expected = assets.first().unwrap().as_ref().unwrap();
@@ -916,7 +1038,7 @@ mod tests {
             }
         }
         //Use assets in cache
-        let result2 = asset_cache.get_or_else(&txid, || {
+        let result2 = asset_cache.get_or_else(&txid_0(), || {
             Err(Error(
                 ErrorKind::Connection("test".to_string()),
                 error_chain::State::default(),
@@ -929,6 +1051,21 @@ mod tests {
             }
             _ => panic!("error"),
         }
+    }
+
+    fn txid_0() -> Sha256dHash {
+        Sha256dHash::from_str("0000000000000000000000000000000000000000000000000000000000000000")
+            .unwrap()
+    }
+
+    fn txid_1() -> Sha256dHash {
+        Sha256dHash::from_str("1111111111111111111111111111111111111111111111111111111111111111")
+            .unwrap()
+    }
+
+    fn txid_2() -> Sha256dHash {
+        Sha256dHash::from_str("2222222222222222222222222222222222222222222222222222222222222222")
+            .unwrap()
     }
 
     fn asset_1(quantity: u64) -> Option<Asset> {
@@ -959,13 +1096,7 @@ mod tests {
     }
 
     fn default_input(index: u32) -> TxIn {
-        let out_point = OutPoint::new(
-            Sha256dHash::from_str(
-                "0000000000000000000000000000000000000000000000000000000000000000",
-            )
-            .unwrap(),
-            index,
-        );
+        let out_point = OutPoint::new(txid_0(), index);
         TxIn {
             previous_output: out_point,
             script_sig: Script::new(),
