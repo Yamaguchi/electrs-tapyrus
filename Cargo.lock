@@ -1029,7 +1029,7 @@ dependencies = [
 [[package]]
 name = "tapyrus"
 version = "0.1.0"
-source = "git+https://github.com/chaintope/rust-tapyrus/#12047544ab64032145aff934ee713ae72540b06e"
+source = "git+https://github.com/chaintope/rust-tapyrus/#0346bec120fc8fcceab1b9b2292faba61327a3eb"
 dependencies = [
  "bitcoin-bech32 0.9.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "bitcoin_hashes 0.7.1 (registry+https://github.com/rust-lang/crates.io-index)",
